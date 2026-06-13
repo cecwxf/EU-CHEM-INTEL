@@ -1,7 +1,10 @@
 node_modules/
 dist/
-data/*.json
+server/data/eu_chem_intel.db
 *.log
 .env
 apiconfig.json
 .DS_Store
+server/data/intel_items.json
+server/data/reports.json
+server/data/action_tracker.json
