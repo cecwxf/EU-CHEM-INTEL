@@ -1,221 +1,277 @@
+/**
+ * SQLite 数据库服务（sql.js 纯 JS 实现）
+ */
+const initSqlJs = require('sql.js');
 const fs = require('fs');
 const path = require('path');
 
-const DATA_DIR = path.join(__dirname, '..', 'data');
-const INTEL_FILE = path.join(DATA_DIR, 'intel_items.json');
-const REPORTS_FILE = path.join(DATA_DIR, 'reports.json');
-const ACTIONS_FILE = path.join(DATA_DIR, 'action_tracker.json');
+const DB_PATH = path.join(__dirname, '..', 'data', 'eu_chem_intel.db');
+const DATA_DIR = path.dirname(DB_PATH);
 
 class DatabaseService {
   constructor() {
-    this.intelItems = [];
-    this.reports = [];
-    this.actions = [];
+    this.db = null;
   }
 
   async initialize() {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    this._loadAll();
-    console.log('[DB] Initialized with', this.intelItems.length, 'intel items,', this.reports.length, 'reports,', this.actions.length, 'actions');
+
+    const SQL = await initSqlJs();
+    if (fs.existsSync(DB_PATH)) {
+      const buf = fs.readFileSync(DB_PATH);
+      this.db = new SQL.Database(buf);
+    } else {
+      this.db = new SQL.Database();
+    }
+    this._createTables();
+    console.log('[DB] SQLite initialized at', DB_PATH);
   }
 
-  _loadAll() {
-    try { this.intelItems = JSON.parse(fs.readFileSync(INTEL_FILE, 'utf8')); } catch(e) { this.intelItems = []; }
-    try { this.reports = JSON.parse(fs.readFileSync(REPORTS_FILE, 'utf8')); } catch(e) { this.reports = []; }
-    try { this.actions = JSON.parse(fs.readFileSync(ACTIONS_FILE, 'utf8')); } catch(e) { this.actions = []; }
+  _createTables() {
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS intel_items (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        summary TEXT DEFAULT '',
+        source_name TEXT DEFAULT '',
+        source_url TEXT DEFAULT '',
+        published_date TEXT DEFAULT '',
+        scraped_date TEXT DEFAULT '',
+        topic_category TEXT DEFAULT 'General',
+        signal_level TEXT DEFAULT 'Monitor',
+        signal_confidence TEXT DEFAULT 'Watch',
+        tags TEXT DEFAULT '[]',
+        raw_content TEXT DEFAULT '',
+        metadata TEXT DEFAULT '{}'
+      )
+    `);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_intel_date ON intel_items(published_date)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_intel_signal ON intel_items(signal_level)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_intel_topic ON intel_items(topic_category)`);
+
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS reports (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        period_start TEXT,
+        period_end TEXT,
+        content TEXT,
+        generated_date TEXT DEFAULT (datetime('now')),
+        status TEXT DEFAULT 'draft'
+      )
+    `);
+
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS action_tracker (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        priority TEXT DEFAULT 'Monitor',
+        created_date TEXT DEFAULT (date('now')),
+        status TEXT DEFAULT 'open'
+      )
+    `);
+    this._save();
   }
 
-  _saveIntel() { fs.writeFileSync(INTEL_FILE, JSON.stringify(this.intelItems, null, 2)); }
-  _saveReports() { fs.writeFileSync(REPORTS_FILE, JSON.stringify(this.reports, null, 2)); }
-  _saveActions() { fs.writeFileSync(ACTIONS_FILE, JSON.stringify(this.actions, null, 2)); }
-
-  // ============ Intel Items ============
-  insertIntelItem(item) {
-    const exists = this.intelItems.find(i => i.id === item.id || i.source_url === item.source_url);
-    if (exists) return; // Skip duplicates
-    this.intelItems.push({
-      id: item.id,
-      title: item.title || '',
-      summary: item.summary || '',
-      source_name: item.source_name || '',
-      source_url: item.source_url || '',
-      published_date: item.published_date || new Date().toISOString().split('T')[0],
-      scraped_date: new Date().toISOString(),
-      topic_category: item.topic_category || 'General',
-      signal_level: item.signal_level || 'Monitor',
-      signal_confidence: item.signal_confidence || 'Watch',
-      tags: item.tags || [],
-      raw_content: item.raw_content || '',
-      metadata: item.metadata || {}
-    });
-    this._saveIntel();
+  _save() {
+    const data = this.db.export();
+    fs.writeFileSync(DB_PATH, Buffer.from(data));
   }
 
-  getIntelItems({ tag, topic, search, page = 1, limit = 50 }) {
-    let items = [...this.intelItems];
-
-    if (tag && tag !== 'All' && !tag.startsWith('__all_')) {
-      // 新标签系统：按重要程度/紧急程度/风险机会筛选
-      if (['高','中','低'].includes(tag)) {
-        items = items.filter(i => (i.metadata?.impact?.importance || '中') === tag);
-      } else if (['立即关注','持续跟踪','定期观察'].includes(tag)) {
-        items = items.filter(i => (i.metadata?.impact?.urgency || '定期观察') === tag);
-      } else if (['风险','机会','中性'].includes(tag)) {
-        items = items.filter(i => (i.metadata?.impact?.risk_opportunity || '中性') === tag);
-      } else if (['Critical','Priority','High','Monitor','Confirmed','Strong Signal','Watch'].includes(tag)) {
-        // 兼容老标签
-        items = items.filter(i => i.signal_level === tag || i.signal_confidence === tag);
-      }
-    }
-    // 如果选了__all_xxx，不筛选该维度
-
-    if (topic && topic !== 'All') {
-      // 新标签：按变化类型ID筛选（存储在 metadata.change_types 数组中）
-      items = items.filter(i => {
-        const changeTypes = (i.metadata?.change_types || []).map(ct => ct.id || ct);
-        return changeTypes.includes(topic) || i.topic_category === topic;
-      });
-    }
-
-    if (search) {
-      const q = search.toLowerCase();
-      items = items.filter(i =>
-        (i.title || '').toLowerCase().includes(q) ||
-        (i.summary || '').toLowerCase().includes(q) ||
-        (i.raw_content || '').toLowerCase().includes(q)
-      );
-    }
-
-    items.sort((a, b) => new Date(b.published_date) - new Date(a.published_date));
-    const total = items.length;
-    const start = (page - 1) * limit;
-    const paged = items.slice(start, start + limit);
-
+  _rowToItem(row) {
     return {
-      items: paged,
-      total,
-      page,
-      totalPages: Math.ceil(total / limit)
+      ...row,
+      tags: JSON.parse(row.tags || '[]'),
+      metadata: JSON.parse(row.metadata || '{}')
     };
   }
 
+  // ============ Intel Items ============
+  insertIntelItem(item) {
+    const exists = this.db.exec('SELECT id FROM intel_items WHERE id=? OR source_url=?',
+      [item.id || '', item.source_url || '']);
+    if (exists.length > 0 && exists[0].values.length > 0) return;
+
+    this.db.run(
+      `INSERT INTO intel_items (id,title,summary,source_name,source_url,published_date,scraped_date,topic_category,signal_level,signal_confidence,tags,raw_content,metadata)
+       VALUES (?,?,?,?,?,?,datetime('now'),?,?,?,?,?,?)`,
+      [
+        item.id, item.title, item.summary || '', item.source_name || '', item.source_url || '',
+        item.published_date || '', item.topic_category || 'General',
+        item.signal_level || 'Monitor', item.signal_confidence || 'Watch',
+        JSON.stringify(item.tags || []), item.raw_content || '', JSON.stringify(item.metadata || {})
+      ]
+    );
+    this._save();
+  }
+
+  getIntelItems({ tag, topic, search, page = 1, limit = 50 }) {
+    let where = ['1=1'];
+    let params = [];
+
+    if (tag && tag !== 'All' && !tag.startsWith('__all_')) {
+      if (['高','中','低'].includes(tag)) {
+        where.push("json_extract(metadata, '$.impact.importance') = ?");
+        params.push(tag);
+      } else if (['立即关注','持续跟踪','定期观察'].includes(tag)) {
+        where.push("json_extract(metadata, '$.impact.urgency') = ?");
+        params.push(tag);
+      } else if (['风险','机会','中性'].includes(tag)) {
+        where.push("json_extract(metadata, '$.impact.risk_opportunity') = ?");
+        params.push(tag);
+      } else if (['Critical','Priority','High','Monitor'].includes(tag)) {
+        where.push('signal_level = ?');
+        params.push(tag);
+      } else if (['Confirmed','Strong Signal','Watch'].includes(tag)) {
+        where.push('signal_confidence = ?');
+        params.push(tag);
+      }
+    }
+
+    if (topic && topic !== 'All') {
+      where.push("(topic_category = ? OR metadata LIKE ?)");
+      params.push(topic, `%"id":"${topic}"%`);
+    }
+
+    if (search) {
+      where.push('(title LIKE ? OR summary LIKE ? OR raw_content LIKE ?)');
+      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+    }
+
+    const countSql = `SELECT COUNT(*) as total FROM intel_items WHERE ${where.join(' AND ')}`;
+    const countResult = this.db.exec(countSql, params);
+    const total = countResult[0]?.values[0]?.[0] || 0;
+
+    const sql = `SELECT * FROM intel_items WHERE ${where.join(' AND ')} ORDER BY published_date DESC LIMIT ? OFFSET ?`;
+    const result = this.db.exec(sql, [...params, limit, (page - 1) * limit]);
+    const items = result[0]?.values.map(row => this._rowToItem({
+      id: row[0], title: row[1], summary: row[2], source_name: row[3], source_url: row[4],
+      published_date: row[5], scraped_date: row[6], topic_category: row[7],
+      signal_level: row[8], signal_confidence: row[9], tags: row[10],
+      raw_content: row[11], metadata: row[12]
+    })) || [];
+
+    return { items, total, page, totalPages: Math.ceil(total / limit) };
+  }
+
   updateItemTags(id, tags) {
-    const item = this.intelItems.find(i => i.id === id);
-    if (item) { item.tags = tags; this._saveIntel(); }
+    this.db.run('UPDATE intel_items SET tags=? WHERE id=?', [JSON.stringify(tags), id]);
+    this._save();
+  }
+
+  get intelItems() {
+    const result = this.db.exec('SELECT * FROM intel_items');
+    return result[0]?.values.map(row => this._rowToItem({
+      id: row[0], title: row[1], summary: row[2], source_name: row[3], source_url: row[4],
+      published_date: row[5], scraped_date: row[6], topic_category: row[7],
+      signal_level: row[8], signal_confidence: row[9], tags: row[10],
+      raw_content: row[11], metadata: row[12]
+    })) || [];
+  }
+
+  set intelItems(items) {
+    this.db.run('DELETE FROM intel_items');
+    const stmt = this.db.prepare(`INSERT INTO intel_items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    items.forEach(i => {
+      stmt.run([i.id, i.title, i.summary||'', i.source_name||'', i.source_url||'',
+        i.published_date||'', i.scraped_date||'', i.topic_category||'General',
+        i.signal_level||'Monitor', i.signal_confidence||'Watch',
+        JSON.stringify(i.tags||[]), i.raw_content||'', JSON.stringify(i.metadata||{})]);
+    });
+    stmt.free();
+    this._save();
   }
 
   // ============ KPI ============
-  // KPI derived from actual data (no hardcoded fallbacks)
   getKPI() {
-    const total = this.intelItems.length;
-    const critical = this.intelItems.filter(i => i.signal_level === 'Critical').length;
-    const priority = this.intelItems.filter(i => i.signal_level === 'Priority').length;
+    const total = this.db.exec('SELECT COUNT(*) FROM intel_items')[0].values[0][0];
+    const critical = this.db.exec("SELECT COUNT(*) FROM intel_items WHERE signal_level='Critical'")[0].values[0][0];
+    const sitesClosed = this.db.exec("SELECT COUNT(*) FROM intel_items WHERE (title||summary) LIKE '%close%' OR (title||summary) LIKE '%shut%' OR (title||summary) LIKE '%停产%' OR (title||summary) LIKE '%关停%'")[0].values[0][0];
+    const capacityRelated = this.db.exec("SELECT COUNT(*) FROM intel_items WHERE topic_category='Capacity' OR (title||summary) LIKE '%capacity%' OR (title||summary) LIKE '%产能%'")[0].values[0][0];
 
-    // 关停站点：统计Capacity主题中涉及关闭/停产/关停/closure/shutdown的条目
-    const sitesClosed = this.intelItems.filter(i => {
-      const txt = (i.title + (i.summary||'')).toLowerCase();
-      return (txt.includes('close') || txt.includes('closure') || txt.includes('shut') ||
-              txt.includes('停产') || txt.includes('关停') || txt.includes('关闭') ||
-              txt.includes('mothball') || txt.includes('idle') || txt.includes('halt'));
-    }).length;
-
-    // 产能影响：统计涉及产能变化的条目（Capacity主题 + M&A中涉及产能的）
-    const capacityRelated = this.intelItems.filter(i => {
-      const txt = (i.title + (i.summary||'')).toLowerCase();
-      return i.topic_category === 'Capacity' ||
-             txt.includes('capacity') || txt.includes('tonne') || txt.includes('产能') ||
-             txt.includes('KT') || txt.includes('MT') || txt.includes('扩产') ||
-             txt.includes('减产') || txt.includes('投产');
-    }).length;
-
-    // 统计涉及的具体数字（从摘要中提取MT/KT数据）
     let mtCapacity = 0;
-    this.intelItems.forEach(i => {
-      const txt = (i.title + (i.summary||''));
-      // 提取 xx KT / xx MT 等产能数字
-      const mtMatch = txt.match(/(\d+[\.,]?\d*)\s*MT/i);
-      const ktMatch = txt.match(/(\d+[\.,]?\d*)\s*KT/i);
-      if (mtMatch) mtCapacity += parseFloat(mtMatch[1]);
-      if (ktMatch) mtCapacity += parseFloat(ktMatch[1]) / 1000;
+    const items = this.intelItems;
+    items.forEach(i => {
+      const txt = (i.title||'') + ' ' + (i.summary||'');
+      const mt = txt.match(/(\d+[\.,]?\d*)\s*MT/i);
+      const kt = txt.match(/(\d+[\.,]?\d*)\s*KT/i);
+      if (mt) mtCapacity += parseFloat(mt[1]);
+      if (kt) mtCapacity += parseFloat(kt[1]) / 1000;
     });
-    // 四舍五入
-    mtCapacity = Math.round(mtCapacity * 10) / 10;
 
     return {
       totalItems: total,
-      critical: critical,
-      priority: priority,
-      sitesClosed: sitesClosed,
-      mtCapacity: mtCapacity || capacityRelated // 如果无法提取具体数字，返回关联条目数
+      critical,
+      sitesClosed,
+      mtCapacity: Math.round(mtCapacity * 10) / 10 || capacityRelated
     };
   }
 
   // ============ Reports ============
   insertReport(report) {
-    this.reports.push({
-      id: report.id,
-      type: report.type,
-      title: report.title,
-      period_start: report.period_start,
-      period_end: report.period_end,
-      content: report.content,
-      generated_date: new Date().toISOString(),
-      status: report.status || 'published'
-    });
-    this._saveReports();
+    this.db.run(
+      `INSERT INTO reports (id,type,title,period_start,period_end,content,status) VALUES (?,?,?,?,?,?,?)`,
+      [report.id, report.type, report.title, report.period_start, report.period_end,
+       JSON.stringify(report.content), report.status || 'published']
+    );
+    this._save();
   }
 
   getReports(type = 'all') {
-    let result = [...this.reports].sort((a, b) => new Date(b.generated_date) - new Date(a.generated_date));
-    if (type !== 'all') result = result.filter(r => r.type === type);
-    return result.slice(0, 20);
+    let sql = 'SELECT * FROM reports';
+    if (type !== 'all') sql += ' WHERE type=?';
+    sql += ' ORDER BY generated_date DESC LIMIT 20';
+    const result = this.db.exec(sql, type !== 'all' ? [type] : []);
+    return result[0]?.values.map(row => ({
+      id: row[0], type: row[1], title: row[2], period_start: row[3], period_end: row[4],
+      content: JSON.parse(row[5] || '{}'), generated_date: row[6], status: row[7]
+    })) || [];
   }
 
   getReportById(id) {
-    return this.reports.find(r => r.id === id) || null;
+    const result = this.db.exec('SELECT * FROM reports WHERE id=?', [id]);
+    if (!result[0]?.values.length) return null;
+    const row = result[0].values[0];
+    return { id: row[0], type: row[1], title: row[2], period_start: row[3], period_end: row[4],
+             content: JSON.parse(row[5] || '{}'), generated_date: row[6], status: row[7] };
   }
 
-  // ============ Company & Product ============
+  // ============ Company / Product / Regulatory ============
   getCompanyUpdates() {
-    return this.intelItems
-      .filter(i => i.topic_category === 'M&A' || i.topic_category === 'Capacity')
-      .sort((a, b) => new Date(b.published_date) - new Date(a.published_date))
-      .slice(0, 100);
+    return this.intelItems.filter(i => i.topic_category === 'M&A' || i.topic_category === 'Capacity').slice(0, 100);
   }
-
   getProductUpdates() {
-    return this.intelItems
-      .filter(i => i.topic_category === 'Technology')
-      .sort((a, b) => new Date(b.published_date) - new Date(a.published_date))
-      .slice(0, 100);
+    return this.intelItems.filter(i => i.topic_category === 'Technology').slice(0, 100);
   }
-
   getRegulatoryUpdates() {
-    return this.intelItems
-      .filter(i => i.topic_category === 'Policy')
-      .sort((a, b) => new Date(b.published_date) - new Date(a.published_date))
-      .slice(0, 50);
+    return this.intelItems.filter(i => i.topic_category === 'Policy').slice(0, 50);
   }
 
   // ============ Action Tracker ============
   getActionTracker() {
-    return this.actions.filter(a => a.status === 'open');
+    const result = this.db.exec("SELECT * FROM action_tracker WHERE status='open' ORDER BY priority DESC");
+    return result[0]?.values.map(row => ({
+      id: row[0], title: row[1], description: row[2], priority: row[3], created_date: row[4], status: row[5]
+    })) || [];
   }
 
   addActionItem(item) {
-    this.actions.push({
-      id: item.id,
-      title: item.title,
-      description: item.description || '',
-      priority: item.priority || 'Monitor',
-      created_date: new Date().toISOString().split('T')[0],
-      status: 'open'
-    });
-    this._saveActions();
+    this.db.run(
+      'INSERT INTO action_tracker (id,title,description,priority) VALUES (?,?,?,?)',
+      [item.id, item.title, item.description || '', item.priority || 'Monitor']
+    );
+    this._save();
   }
 
   getIntelCount() {
-    return this.intelItems.length;
+    return this.db.exec('SELECT COUNT(*) FROM intel_items')[0].values[0][0];
+  }
+
+  // for seed migration
+  get intelCount() {
+    return this.getIntelCount();
   }
 }
 
